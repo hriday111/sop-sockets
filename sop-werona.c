@@ -42,24 +42,6 @@ void initialize_clients(client_t *clients) {
   }
 }
 
-int find_free_client_index(client_t *clients) {
-  for (int i = 0; i < MAX_CLIENTS; i++) {
-    if (clients[i].fd == -1) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-int find_client_index(client_t *clients, int fd) {
-  for (int i = 0; i < MAX_CLIENTS; i++) {
-    if (clients[i].fd == fd) {
-      return i;
-    }
-  }
-  return -1;
-}
-
 void delete_client(client_t *clients, int idx) {
   if (idx < 0 || idx >= MAX_CLIENTS)
     return;
@@ -87,6 +69,73 @@ static void consume_line(client_t *c, char *nl) {
   c->buff_size = remainder;
   c->buff[c->buff_size] = '\0';
 }
+int find_free_client_index(client_t *clients) {
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (clients[i].fd == -1) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+int find_client_index(client_t *clients, int fd) {
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (clients[i].fd == fd) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+void perform_wedding(client_t *clients, int i, int j) {
+  /* Pick a consistent ordering for messages, e.g. always "i" perspective: */
+  const char *a = clients[i].name;
+  const char *b = clients[i].name_of_beloved;
+
+  printf("%s and %s got married!\n", a, b);
+
+  char msg[MAX_MSG_LEN + 64]; /* pick a safe upper bound */
+  int n = snprintf(msg, sizeof(msg), "Congratulations, %s and %s!\n", a, b);
+  if (n < 0 || (size_t)n >= sizeof(msg)) {
+    /* handle truncation/error your way */
+  }
+
+  int fd_i = clients[i].fd;
+  int fd_j = clients[j].fd;
+
+  if (bulk_write(fd_i, msg, (size_t)n) < 0)
+    ERR("bulk_write");
+  if (bulk_write(fd_j, msg, (size_t)n) < 0)
+    ERR("bulk_write");
+
+  /* Close both slots; if you delete by index, mind using stable indices:
+     delete higher index first, or copy indices then delete. */
+  int hi = i > j ? i : j;
+  int lo = i > j ? j : i;
+  delete_client(clients, hi);
+  delete_client(clients, lo);
+}
+int find_partner_index(client_t *clients, int i) {
+  if (clients[i].fd < 0)
+    return -1;
+  if (clients[i].name[0] == '\0' || clients[i].name_of_beloved[0] == '\0')
+    return -1;
+
+  for (int j = 0; j < MAX_CLIENTS; j++) {
+    if (j == i)
+      continue;
+    if (clients[j].fd < 0)
+      continue;
+    if (clients[j].name[0] == '\0' || clients[j].name_of_beloved[0] == '\0')
+      continue;
+
+    if (strcmp(clients[i].name, clients[j].name_of_beloved) == 0 &&
+        strcmp(clients[j].name, clients[i].name_of_beloved) == 0) {
+      return j;
+    }
+  }
+  return -1;
+}
 
 void doServer(int local_listen_socket, int timeout) {
   int epoll_descriptor;
@@ -104,7 +153,7 @@ void doServer(int local_listen_socket, int timeout) {
   client_t clients[MAX_CLIENTS];
   initialize_clients(clients);
 
-  while (1) {
+  for (;;) {
     if ((nfds = epoll_wait(epoll_descriptor, events, MAX_EPOLL_EVENTS,
                            timeout * 1000)) == -1) {
       ERR("epoll_wait");
@@ -149,26 +198,27 @@ void doServer(int local_listen_socket, int timeout) {
         if (client_idx < 0)
           continue;
 
-        size_t space =
-            sizeof(clients[client_idx].buff) - 1 - (size_t)clients[client_idx].buff_size;
+        size_t space = sizeof(clients[client_idx].buff) - 1 -
+                       (size_t)clients[client_idx].buff_size;
         if (space == 0) {
-          const char *dn = clients[client_idx].name[0] ? clients[client_idx].name
-                                                         : "??";
+          const char *dn =
+              clients[client_idx].name[0] ? clients[client_idx].name : "??";
           printf("I lost contact with %s\n", dn);
           delete_client(clients, client_idx);
           continue;
         }
 
         ssize_t bytes_read =
-            read(fd, clients[client_idx].buff + clients[client_idx].buff_size, space);
+            read(fd, clients[client_idx].buff + clients[client_idx].buff_size,
+                 space);
         if (bytes_read < 0) {
           if (errno == EAGAIN || errno == EWOULDBLOCK)
             continue;
           ERR("read");
         }
         if (bytes_read == 0) {
-          const char *dn = clients[client_idx].name[0] ? clients[client_idx].name
-                                                         : "??";
+          const char *dn =
+              clients[client_idx].name[0] ? clients[client_idx].name : "??";
           printf("I lost contact with %s\n", dn);
           delete_client(clients, client_idx);
           continue;
@@ -186,13 +236,22 @@ void doServer(int local_listen_socket, int timeout) {
             clients[client_idx].name[MAX_MSG_LEN] = '\0';
             consume_line(&clients[client_idx], nl);
           } else if (clients[client_idx].name_of_beloved[0] == '\0') {
+
             strncpy(clients[client_idx].name_of_beloved,
                     clients[client_idx].buff, MAX_MSG_LEN);
+
             clients[client_idx].name_of_beloved[MAX_MSG_LEN] = '\0';
             printf("%s wants to marry %s\n", clients[client_idx].name,
                    clients[client_idx].name_of_beloved);
-            delete_client(clients, client_idx);
-            break;
+
+            int partner_idx = find_partner_index(clients, client_idx);
+            /* Partner index can be 0 — must use >= 0, not > 0. */
+            if (partner_idx >= 0) {
+              perform_wedding(clients, client_idx, partner_idx);
+              break;
+            }
+
+            consume_line(&clients[client_idx], nl);
           } else {
             consume_line(&clients[client_idx], nl);
           }
