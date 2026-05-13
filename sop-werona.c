@@ -22,10 +22,12 @@ void usage(char *name) {
 #define UNIX_SK_NAME "Laurenty"
 #define MAX_MSG_LEN 63
 #define BACKLOG 3
-#define MAX_EPOLL_EVENTS (MAX_CLIENTS + 1)
+/* listen + stdin + up to all clients ready in one wakeup */
+#define MAX_EPOLL_EVENTS (MAX_CLIENTS + 3)
 
 typedef struct client {
   int fd;
+  int partner; /* index in clients[], -1 if none / not married yet */
   char name[MAX_MSG_LEN + 1];
   char name_of_beloved[MAX_MSG_LEN + 1];
   char buff[MAX_MSG_LEN + 1];
@@ -35,6 +37,7 @@ typedef struct client {
 void initialize_clients(client_t *clients) {
   for (int i = 0; i < MAX_CLIENTS; i++) {
     clients[i].fd = -1;
+    clients[i].partner = -1;
     clients[i].name[0] = '\0';
     clients[i].buff[0] = '\0';
     clients[i].name_of_beloved[0] = '\0';
@@ -45,9 +48,13 @@ void initialize_clients(client_t *clients) {
 void delete_client(client_t *clients, int idx) {
   if (idx < 0 || idx >= MAX_CLIENTS)
     return;
+  int p = clients[idx].partner;
+  if (p >= 0 && p < MAX_CLIENTS && clients[p].partner == idx)
+    clients[p].partner = -1;
   if (clients[idx].fd != -1)
     close(clients[idx].fd);
   clients[idx].fd = -1;
+  clients[idx].partner = -1;
   clients[idx].name[0] = '\0';
   clients[idx].name_of_beloved[0] = '\0';
   clients[idx].buff[0] = '\0';
@@ -69,6 +76,7 @@ static void consume_line(client_t *c, char *nl) {
   c->buff_size = remainder;
   c->buff[c->buff_size] = '\0';
 }
+
 int find_free_client_index(client_t *clients) {
   for (int i = 0; i < MAX_CLIENTS; i++) {
     if (clients[i].fd == -1) {
@@ -87,34 +95,37 @@ int find_client_index(client_t *clients, int fd) {
   return -1;
 }
 
+int find_client_by_name(client_t *clients, const char *name) {
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (clients[i].fd < 0)
+      continue;
+    if (strcmp(clients[i].name, name) == 0)
+      return i;
+  }
+  return -1;
+}
+
 void perform_wedding(client_t *clients, int i, int j) {
-  /* Pick a consistent ordering for messages, e.g. always "i" perspective: */
   const char *a = clients[i].name;
   const char *b = clients[i].name_of_beloved;
 
   printf("%s and %s got married!\n", a, b);
 
-  char msg[MAX_MSG_LEN + 64]; /* pick a safe upper bound */
+  char msg[MAX_MSG_LEN + 64];
   int n = snprintf(msg, sizeof(msg), "Congratulations, %s and %s!\n", a, b);
-  if (n < 0 || (size_t)n >= sizeof(msg)) {
-    /* handle truncation/error your way */
-  }
+  if (n < 0 || (size_t)n >= sizeof(msg))
+    ERR("snprintf");
 
-  int fd_i = clients[i].fd;
-  int fd_j = clients[j].fd;
-
-  if (bulk_write(fd_i, msg, (size_t)n) < 0)
+  if (bulk_write(clients[i].fd, msg, (size_t)n) < 0)
     ERR("bulk_write");
-  if (bulk_write(fd_j, msg, (size_t)n) < 0)
+  if (bulk_write(clients[j].fd, msg, (size_t)n) < 0)
     ERR("bulk_write");
 
-  /* Close both slots; if you delete by index, mind using stable indices:
-     delete higher index first, or copy indices then delete. */
-  int hi = i > j ? i : j;
-  int lo = i > j ? j : i;
-  delete_client(clients, hi);
-  delete_client(clients, lo);
+  /* Stage 4: stay connected; link partners for relay. */
+  clients[i].partner = j;
+  clients[j].partner = i;
 }
+
 int find_partner_index(client_t *clients, int i) {
   if (clients[i].fd < 0)
     return -1;
@@ -137,11 +148,86 @@ int find_partner_index(client_t *clients, int i) {
   return -1;
 }
 
+static void relay_chat_line(client_t *clients, int from_idx, char *nl) {
+  int p = clients[from_idx].partner;
+  if (p < 0 || p >= MAX_CLIENTS || clients[p].fd < 0) {
+    consume_line(&clients[from_idx], nl);
+    return;
+  }
+
+  const char *line = clients[from_idx].buff;
+  size_t L = strlen(line);
+  if (L > (size_t)MAX_MSG_LEN) {
+    consume_line(&clients[from_idx], nl);
+    return;
+  }
+
+  char out[MAX_MSG_LEN + 2];
+  memcpy(out, line, L);
+  out[L] = '\n';
+  if (bulk_write(clients[p].fd, out, L + 1) < 0)
+    ERR("bulk_write");
+
+  consume_line(&clients[from_idx], nl);
+}
+
+static void consume_stdin_prefix(char *buf, int *size, char *nl) {
+  int remainder = *size - (int)(nl - buf) - 1;
+  if (remainder < 0)
+    remainder = 0;
+  memmove(buf, nl + 1, (size_t)remainder);
+  *size = remainder;
+  buf[*size] = '\0';
+}
+
+static void process_stdin_line(char *line, client_t *clients) {
+  char *colon = strchr(line, ':');
+  if (colon == NULL || colon == line) {
+    fprintf(stderr, "Invalid stdin line (expected addressee:message)\n");
+    return;
+  }
+  *colon = '\0';
+  const char *addressee = line;
+  char *message = colon + 1;
+  while (*message == ' ' || *message == '\t')
+    message++;
+
+  if (addressee[0] == '\0' || message[0] == '\0') {
+    fprintf(stderr, "Invalid stdin line (empty addressee or message)\n");
+    return;
+  }
+
+  int idx = find_client_by_name(clients, addressee);
+  if (idx < 0) {
+    fprintf(stderr, "Unknown addressee: %s\n", addressee);
+    return;
+  }
+
+  size_t mlen = strlen(message);
+  if (mlen > (size_t)MAX_MSG_LEN) {
+    fprintf(stderr, "Message too long\n");
+    return;
+  }
+
+  char out[MAX_MSG_LEN + 2];
+  memcpy(out, message, mlen);
+  out[mlen] = '\n';
+  if (bulk_write(clients[idx].fd, out, mlen + 1) < 0)
+    ERR("bulk_write");
+}
+
 void doServer(int local_listen_socket, int timeout) {
   int epoll_descriptor;
   if ((epoll_descriptor = epoll_create1(0)) < 0) {
     ERR("epoll_create:");
   }
+
+  int stdin_flags = fcntl(STDIN_FILENO, F_GETFL);
+  if (stdin_flags < 0)
+    ERR("fcntl stdin F_GETFL");
+  if (fcntl(STDIN_FILENO, F_SETFL, stdin_flags | O_NONBLOCK) < 0)
+    ERR("fcntl stdin F_SETFL");
+
   struct epoll_event event, events[MAX_EPOLL_EVENTS];
   event.events = EPOLLIN;
   event.data.fd = local_listen_socket;
@@ -149,9 +235,23 @@ void doServer(int local_listen_socket, int timeout) {
       -1) {
     ERR("epoll_ctl");
   }
+
+  bool stdin_epoll = true;
+  event.data.fd = STDIN_FILENO;
+  if (epoll_ctl(epoll_descriptor, EPOLL_CTL_ADD, STDIN_FILENO, &event) == -1) {
+    /* Some environments forbid epolling stdin; relay from clients still works. */
+    fprintf(stderr, "epoll_ctl(STDIN): %s (stdin relay disabled)\n",
+            strerror(errno));
+    stdin_epoll = false;
+  }
+
   int nfds;
   client_t clients[MAX_CLIENTS];
   initialize_clients(clients);
+
+  char stdin_buff[MAX_MSG_LEN + 1];
+  int stdin_size = 0;
+  stdin_buff[0] = '\0';
 
   for (;;) {
     if ((nfds = epoll_wait(epoll_descriptor, events, MAX_EPOLL_EVENTS,
@@ -192,6 +292,38 @@ void doServer(int local_listen_socket, int timeout) {
               -1) {
             ERR("epoll_ctl");
           }
+        }
+      } else if (stdin_epoll && fd == STDIN_FILENO) {
+        size_t space = sizeof(stdin_buff) - 1 - (size_t)stdin_size;
+        if (space == 0) {
+          fprintf(stderr, "Stdin buffer overflow, line too long\n");
+          stdin_size = 0;
+          stdin_buff[0] = '\0';
+          continue;
+        }
+        ssize_t br = read(STDIN_FILENO, stdin_buff + stdin_size, space);
+        if (br < 0) {
+          if (errno == EAGAIN || errno == EWOULDBLOCK)
+            continue;
+          ERR("read stdin");
+        }
+        if (br == 0) {
+          /* EOF on stdin: stop watching it */
+          if (epoll_ctl(epoll_descriptor, EPOLL_CTL_DEL, STDIN_FILENO, NULL) ==
+              -1) {
+            /* ignore if already removed */
+          }
+          stdin_size = 0;
+          continue;
+        }
+        stdin_size += (int)br;
+        stdin_buff[stdin_size] = '\0';
+
+        char *nl;
+        while ((nl = strchr(stdin_buff, '\n')) != NULL) {
+          *nl = '\0';
+          process_stdin_line(stdin_buff, clients);
+          consume_stdin_prefix(stdin_buff, &stdin_size, nl);
         }
       } else {
         int client_idx = find_client_index(clients, fd);
@@ -245,15 +377,20 @@ void doServer(int local_listen_socket, int timeout) {
                    clients[client_idx].name_of_beloved);
 
             int partner_idx = find_partner_index(clients, client_idx);
-            /* Partner index can be 0 — must use >= 0, not > 0. */
             if (partner_idx >= 0) {
               perform_wedding(clients, client_idx, partner_idx);
-              break;
+              consume_line(&clients[client_idx], nl);
+              /* More lines may remain in buff (e.g. chat); keep parsing. */
+            } else {
+              consume_line(&clients[client_idx], nl);
             }
-
-            consume_line(&clients[client_idx], nl);
           } else {
-            consume_line(&clients[client_idx], nl);
+            if (clients[client_idx].partner >= 0) {
+              relay_chat_line(clients, client_idx, nl);
+            } else {
+              /* No partner (unmatched): discard complete lines. */
+              consume_line(&clients[client_idx], nl);
+            }
           }
         }
       }
